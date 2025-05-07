@@ -629,6 +629,7 @@ int main(int argc, char **argv) {
   for (auto &&[K, _] : D) {
     Names.emplace_back(K);
   }
+  std::ranges::sort(Names);
   for (auto &&K : Names) {
     S.ProcessOutputEvent(LeftOutputEvent(C->End, K));
   }
