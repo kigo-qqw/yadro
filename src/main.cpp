@@ -14,7 +14,6 @@
 #include <memory>
 #include <optional>
 #include <ostream>
-#include <queue>
 #include <regex>
 #include <string>
 #include <string_view>
@@ -171,9 +170,16 @@ struct ClientState {
   TableId TableId;
 };
 
+struct ClientAtTableState {
+  ClientNameRef ClientName;
+  Time Start;
+  Time End;
+};
+
 struct Table {
-  bool Busy{false};
-  std::optional<ClientName> ClientName;
+  std::optional<ClientAtTableState> State;
+  decltype(std::declval<Config>().HourCost) Earned;
+  Time TotalUsed;
 };
 
 class State final {
@@ -213,6 +219,30 @@ class State final {
 
   void ProcessOutputEvent(const OutputEvent &OE);
 
+  void ProcessCame(ClientNameRef Name) {
+    auto &&[InsertedIt, IsInserted] = mData.emplace(Name, ClientState{.TableId = kTableIdUnknown});
+    if (IsInserted) {
+      mWaitingQueue.emplace_back(InsertedIt->first);
+    }
+  }
+
+  void ProcessSitDown(ClientNameRef Name, TableId Id, Time Time) {
+    auto &&It = mData.find(Name);
+    if (It == std::end(mData)) return;
+
+    if (It->second.TableId != kTableIdUnknown) {
+      mTables[TableIndex(It->second.TableId)].State = std::nullopt;
+    } else {
+      auto &&[First, Last] = std::ranges::remove(mWaitingQueue, Name);
+      mWaitingQueue.erase(First, Last);
+    }
+
+    mTables[TableIndex(Id)].State.emplace(
+            ClientAtTableState{.ClientName = {It->first}, .Start = Time, .End = {Time::zero()}});
+    It->second.TableId = Id;
+  }
+
+  void ProcessLeft(ClientNameRef Name, Time Time);
 
   friend std::ostream &operator<<(std::ostream &OS, State &S) {
     OS << "State{{mData=";
@@ -225,7 +255,10 @@ class State final {
     }
     OS << ", mTables=";
     for (auto &&T : S.Tables()) {
-      OS << "{" << T.Busy << ", " << (T.ClientName ? *T.ClientName : "std::nullopt") << "}, ";
+      OS << "{";
+      if (T.State) OS << "{" << T.State->ClientName << ", " << T.State->Start << ", " << T.State->End << "}";
+      else OS << "std::nullopt";
+      OS << ", " << T.Earned << ", " << std::format("{}", T.TotalUsed) << "}, ";
     }
     return OS << std::format(", mConfig={}}}", S.Config());
   }
@@ -289,16 +322,7 @@ class LeftOutputEvent : public OutputEvent {
   ~LeftOutputEvent() noexcept override = default;
 
   void Process(State &S) const override {
-    auto &&D = S.Data();
-    auto &&T = S.Tables();
-    auto &&It = D.find(mClientName);
-
-    if (It != std::end(D)) {
-      if (It->second.TableId == kTableIdUnknown) return;
-      auto &&I = TableIndex(It->second.TableId);
-      T[I] = {.Busy = false, .ClientName = std::nullopt};
-      D.erase(It);
-    }
+    S.ProcessLeft(mClientName, mTime);
   }
 
   void Print(std::ostream &OS) const override {
@@ -322,7 +346,9 @@ class SitDownOutputEvent : public OutputEvent {
       : OutputEvent(EventTime, OutputEventType::SitDown), mClientName{ClientName}, mTableId{Id} {}
   ~SitDownOutputEvent() noexcept override = default;
 
-  void Process(State &S) const override {}
+  void Process(State &S) const override {
+    S.ProcessSitDown(mClientName, mTableId, mTime);
+  }
 
   void Print(std::ostream &OS) const override {
     OS << ClientName() << " " << TableId();
@@ -373,7 +399,6 @@ class CameInputEvent : public InputEvent {
 
   void Process(State &S) const override {
     auto &D = S.Data();
-    auto &Q = S.WaitingQueue();
     auto &&It = D.find(mClientName);
 
     if (mTime < S.Config().Start or mTime > S.Config().End) {
@@ -386,10 +411,7 @@ class CameInputEvent : public InputEvent {
       return;
     }
 
-    auto &&[InsertedIt, IsInserted] = D.emplace(mClientName, ClientState{.TableId = kTableIdUnknown});
-    if (IsInserted) {
-      Q.emplace_back(InsertedIt->first);
-    }
+    S.ProcessCame(mClientName);
   }
 
   void Print(std::ostream &OS) const override {
@@ -416,7 +438,6 @@ class SitDownInputEvent : public InputEvent {
   void Process(State &S) const override {
     auto &D = S.Data();
     auto &T = S.Tables();
-    auto &Q = S.WaitingQueue();
     auto &&It = D.find(mClientName);
 
     if (It == std::end(D)) {
@@ -424,22 +445,13 @@ class SitDownInputEvent : public InputEvent {
       return;
     }
 
-    auto &&TargetTable = T[TableIndex(mTableId)];
+    auto &TargetTable = T[TableIndex(mTableId)];
 
-    if (TargetTable.Busy) {
+    if (TargetTable.State) {
       S.ProcessOutputEvent(ErrorOutputEvent(mTime, OutputErrorType::PlaceIsBusy));
       return;
     }
-
-    if (It->second.TableId != kTableIdUnknown) {
-      T[TableIndex(It->second.TableId)] = {.Busy = false, .ClientName = std::nullopt};
-    } else {
-      auto &&[First, Last] = std::ranges::remove(Q, mClientName);
-      Q.erase(First, Last);
-    }
-
-    TargetTable = {.Busy = true, .ClientName = {It->first}};
-    It->second.TableId = mTableId;
+    S.ProcessSitDown(mClientName, mTableId, mTime);
   }
 
   void Print(std::ostream &OS) const override {
@@ -471,7 +483,7 @@ class WaitInputEvent : public InputEvent {
     auto &T = S.Tables();
     auto &C = S.Config();
 
-    auto &&AmountOfBusyTables = std::ranges::count_if(T, [](auto &&Tbl) { return Tbl.Busy; });
+    auto &&AmountOfBusyTables = std::ranges::count_if(T, [](auto &&Tbl) { return Tbl.State.has_value(); });
 
     if (AmountOfBusyTables < C.TableCount) {
       S.ProcessOutputEvent(ErrorOutputEvent(mTime, OutputErrorType::ICanWaitNoLonger));
@@ -508,37 +520,12 @@ class LeftInputEvent : public InputEvent {
 
   void Process(State &S) const override {
     auto &D = S.Data();
-    auto &Q = S.WaitingQueue();
-    auto &T = S.Tables();
-
     auto &&It = D.find(mClientName);
     if (It == std::end(D)) {
       S.ProcessOutputEvent(ErrorOutputEvent(mTime, OutputErrorType::ClientUnknown));
       return;
     }
-
-    if (It->second.TableId == kTableIdUnknown) {
-      D.erase(It);
-      return;
-    }
-    auto &&I = TableIndex(It->second.TableId);
-
-    D.erase(It);
-
-    if (not Q.empty()) {
-      auto &&ClientToSit = Q.front();
-      auto &&ClientToSitIt = D.find(ClientToSit);
-
-      T[I] = {.Busy = true, .ClientName = {ClientToSitIt->first}};
-      auto &&TId = TableIndexToId(I);
-      ClientToSitIt->second.TableId = TId;
-
-      Q.pop_front();
-
-      S.ProcessOutputEvent(SitDownOutputEvent(mTime, ClientToSitIt->first, TId));
-    } else {
-      T[I] = {.Busy = false, .ClientName = std::nullopt};
-    }
+    S.ProcessLeft(mClientName, mTime);
   }
 
   void Print(std::ostream &OS) const override {
@@ -588,6 +575,34 @@ void State::ProcessOutputEvent(const OutputEvent &OE) {
   OE.Process(*this);
 }
 
+void State::ProcessLeft(ClientNameRef Name, Time Time) {
+  auto &&It = mData.find(Name);
+  if (It->second.TableId == kTableIdUnknown) {
+    mData.erase(It);
+    return;
+  }
+  auto &&I = TableIndex(It->second.TableId);
+
+  if (auto &CS = mTables[I].State) {
+    CS->End = Time;
+    auto &&TimeDelta = CS->End - CS->Start;
+    auto &&HoursUsed = std::chrono::ceil<std::chrono::hours>(TimeDelta);
+    mTables[I].Earned += HoursUsed.count() * mConfig.HourCost;
+    mTables[I].TotalUsed += TimeDelta;
+  }
+
+  mData.erase(It);
+
+  if (not mWaitingQueue.empty()) {
+    auto &&ClientToSit = mWaitingQueue.front();
+    auto &&ClientToSitIt = mData.find(ClientToSit);
+
+    ProcessOutputEvent(SitDownOutputEvent(Time, ClientToSitIt->first, TableIndexToId(I)));
+  } else {
+    mTables[I].State = std::nullopt;
+  }
+}
+
 int main(int argc, char **argv) {
   auto &&Args = CliArguments::ParseArguments(argc, argv);
 
@@ -601,22 +616,28 @@ int main(int argc, char **argv) {
   State S(*C);
   while (!IF.eof()) {
     auto &&IE = ParseInputEvent(IF);
-    if (!IE) break;  // FIXME:
+    if (!IE) break;
 
     std::cout << **IE << std::endl;
     (*IE)->Process(S);
   }
 
-  // TODO: kick all clients
   auto &&D = S.Data();
-  auto &&DEnd = std::end(D);
-  for (auto &&It = std::begin(D), NextIt = DEnd; It != DEnd; It = NextIt) {
-    NextIt = std::next(It);
-    S.ProcessOutputEvent(LeftOutputEvent(C->End, It->first));
+
+  std::vector<ClientNameRef> Names;
+  Names.reserve(D.size());
+  for (auto &&[K, _] : D) {
+    Names.emplace_back(K);
+  }
+  for (auto &&K : Names) {
+    S.ProcessOutputEvent(LeftOutputEvent(C->End, K));
   }
 
   std::cout << std::format("{}", C->End) << std::endl;
 
-
+  auto &&T = S.Tables();
+  for (u64 I = 0; I < static_cast<u64>(C->TableCount); ++I) {
+    std::cout << I + 1 << " " << T[I].Earned << " " << std::format("{}", T[I].TotalUsed) << std::endl;
+  }
   return 0;
 }
